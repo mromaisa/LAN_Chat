@@ -6,84 +6,109 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
+#define MAX_CLIENTS 5
 
-int main(int argv, char* argc){
-    // create a server socket
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    if(server_fd == 0){
-        // int logs_network = open("network_logs.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-        // write(logs_network, "Socket creation failed\n", 23);
-        // close(logs_network);
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // Step 2: Bind the socket to an IP/port
+struct client_info {
+    int socket_fd;
     struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr=INADDR_ANY;
-    address.sin_port= htons(PORT);
+    char username[50];
+};
 
-    if(bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0){
-        // int logs_network = open("network_logs.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-        // write(logs_network, "Binding failed\n", 15);
-        // close(logs_network);
-        perror("Binding failed");
-        exit(EXIT_FAILURE);
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct client_info* clients[MAX_CLIENTS];
+int client_count = 0;
+
+void broadcast_message(const char* message, struct client_info* sender) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i]->socket_fd != sender->socket_fd) {
+            send(clients[i]->socket_fd, message, strlen(message), 0);
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void* client_handler(void* arg) {
+    struct client_info* cli = (struct client_info*) arg;
+    char buffer[BUFFER_SIZE];
+    int bytesRead;
+
+    // Ask username
+    send(cli->socket_fd, "Enter username: ", 16, 0);
+    bytesRead = read(cli->socket_fd, buffer, BUFFER_SIZE);
+    buffer[bytesRead - 1] = '\0';
+    strcpy(cli->username, buffer);
+
+    printf("User connected: %s\n", cli->username);
+
+    // Chat loop
+    while ((bytesRead = read(cli->socket_fd, buffer, BUFFER_SIZE)) > 0) {
+        buffer[bytesRead] = '\0';
+
+        char formatted[1100];
+        snprintf(formatted, sizeof(formatted), "%s: %s", cli->username, buffer);
+
+        printf("%s", formatted);
+        broadcast_message(formatted, cli);
     }
 
-    // Step 3: Listen for incoming connections
-    if(listen(server_fd, 5) < 0){
-        // int logs_network = open("network_logs.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-        // write(logs_network, "Listening failed\n", 17);
-        // close(logs_network);
-        perror("Listening failed");
-        exit(EXIT_FAILURE);
-    }
+    // Cleanup
+    close(cli->socket_fd);
 
-    printf("Server listening on port %d\n", PORT);
-
-    // Step 4: Accept a connection
-    struct sockaddr_in client_address;
-    socklen_t client_addrlen = sizeof(client_address);
-
-
-    int client_array[5];
-    int i=0;
-    while(1){
-        if (i>=5){
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i] == cli) {
+            clients[i] = clients[client_count - 1];
             break;
         }
-        int newSocket = accept(server_fd, (struct sockaddr* )&client_address, &client_addrlen);
-        if(newSocket < 0){
-            // int logs_network = open("network_logs.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-            // write(logs_network, "Accepting connection failed\n", 28);
-            // close(logs_network);
-            perror("Accepting connection failed");
-            exit(EXIT_FAILURE);
-        }
-        printf("Connection accepted from %s:%d\n", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
-        client_array[i]=newSocket;
-        i++;
+    }
+    client_count--;
+    pthread_mutex_unlock(&clients_mutex);
 
+    free(cli);
+    return NULL;
+}
+
+int main() {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("Socket failed"); exit(1); }
+
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        exit(1);
     }
 
-    char buffer[BUFFER_SIZE] = {0};
-    int bytesRead = read(newSocket, buffer, BUFFER_SIZE);
-    if(bytesRead < 0){
-        // int logs_network = open("network_logs.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
-        // write(logs_network, "Reading from socket failed\n", 27);
-        // close(logs_network);
-        perror("Reading from socket failed");
-        close(newSocket);
-        exit(EXIT_FAILURE);
-    }
+    listen(server_fd, MAX_CLIENTS);
+    printf("Server running on port %d\n", PORT);
 
-    printf("Message from client: %s\n", buffer);
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+
+        int new_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+
+        struct client_info* cli = malloc(sizeof(struct client_info));
+        cli->socket_fd = new_socket;
+        cli->address = client_addr;
+
+        pthread_mutex_lock(&clients_mutex);
+        clients[client_count++] = cli;
+        pthread_mutex_unlock(&clients_mutex);
+
+        pthread_t thread;
+        pthread_create(&thread, NULL, client_handler, cli);
+        pthread_detach(thread);
+    }
 
     return 0;
 }
